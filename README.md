@@ -1,7 +1,6 @@
                                                                                                                                                                                                                              <img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/c22c0bdd-0dcd-4663-a856-57ea9ca19fa6" />
 
 
-# This web panel doesn't have any security either login by password or key and anything else,means use on your local network only and makesure only authorized person only can access it
 # 💾 DiskHealth Fleet Monitor
 
 A self-hosted Windows disk health monitoring system. A lightweight Python/Flask server collects SMART data, temperatures, and volume usage from Windows agents across your network and displays everything in a real-time web dashboard.
