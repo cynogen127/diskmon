@@ -109,6 +109,14 @@ Default port: **8765**. Open `http://your-server-ip:8765` in a browser.
 
 ### 5. Install the agent on Windows machines
 
+### Options 1 : 
+
+run dotnet publish -c Release  to build the agent .exe installer 
+
+Then right click on DiskHealthAgent.exe run as administrator to avoid any permissions issue since this agent will install smartmontools
+
+### Options 2 : 
+
 On each Windows machine you want to monitor, open PowerShell as Administrator:
 
 ```powershell
