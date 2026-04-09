@@ -11,7 +11,9 @@ A self-hosted Windows disk health monitoring system. A lightweight Python/Flask 
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
+##IMPORTANTS NOTES
 
+**This Agent also have function that will register desktop/laptop to snipe-IT asset,if you have the snipe-IT deployed so change the ip and token in code if not,just key in the name then continue install the agent 
 ## Screenshots
 
 | Dashboard Overview | Heatmap | Trends |
