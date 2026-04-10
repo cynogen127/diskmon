@@ -3,8 +3,6 @@ using System.IO;
 
 namespace SnipeAgent
 {
-    // Both PowerShell scripts are embedded as C# string constants.
-    // At runtime they are extracted to a temp folder and executed — no external files needed.
     static class AgentScripts
     {
         public const string Agent = @"# ==============================================================================
@@ -138,32 +136,48 @@ function Update-Self {
     $tmp  = ""$dest.new""
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $scriptUrl -OutFile $tmp -ErrorAction Stop
+        try {
+            $rawBytes = [System.IO.File]::ReadAllBytes($tmp)
+            if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+                [System.IO.File]::WriteAllBytes($tmp, $rawBytes[3..($rawBytes.Length-1)])
+            }
+        } catch {}
         Move-Item -Force $tmp $dest
         Log-Info ""Agent updated from $scriptUrl""
-        # Also update tray script if available
         try {
             $trayUrl  = ""$ServerUrl/agent/tray.ps1""
             $trayDest = Join-Path $AgentDir ""DiskHealthTray.ps1""
             $trayTmp  = ""$trayDest.new""
             Invoke-WebRequest -UseBasicParsing -Uri $trayUrl -OutFile $trayTmp -ErrorAction Stop
+            try {
+                $rawBytes = [System.IO.File]::ReadAllBytes($trayTmp)
+                if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+                    [System.IO.File]::WriteAllBytes($trayTmp, $rawBytes[3..($rawBytes.Length-1)])
+                }
+            } catch {}
             Move-Item -Force $trayTmp $trayDest
             Log-Info ""Tray script updated.""
-            # Register tray logon task if not already present
+            $trayVbsDest = Join-Path $AgentDir ""StartTray.vbs""
+            $q2 = [char]34
+            $vbs2 = 'Dim sh : Set sh = CreateObject(' + $q2 + 'WScript.Shell' + $q2 + ')' + [char]13 + [char]10 +
+                    'sh.Run ' + $q2 + 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + $q2 + $q2 + $trayDest + $q2 + $q2 + $q2 + ', 0, False' + [char]13 + [char]10 +
+                    'Set sh = Nothing'
+            [System.IO.File]::WriteAllText($trayVbsDest, $vbs2, [System.Text.Encoding]::ASCII)
             $trayTask = Get-ScheduledTask -TaskName ""DiskHealthTray"" -ErrorAction SilentlyContinue
             if (-not $trayTask) {
                 try {
-                    $ta = New-ScheduledTaskAction -Execute ""powershell.exe"" -Argument ""-NonInteractive -ExecutionPolicy Bypass -File `""$trayDest`""""
+                    $ta = New-ScheduledTaskAction -Execute ""wscript.exe"" -Argument ""//B //Nologo `""$trayVbsDest`""""
                     $tr = New-ScheduledTaskTrigger -AtLogOn
-                    Register-ScheduledTask -TaskName ""DiskHealthTray"" -Action $ta -Trigger $tr -RunLevel Limited -Force | Out-Null
+                    $ts = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+                    Register-ScheduledTask -TaskName ""DiskHealthTray"" -Action $ta -Trigger $tr -Settings $ts -RunLevel Limited -Force | Out-Null
                     Log-Info ""Tray logon task registered.""
                 } catch { Log-Info ""Tray task registration skipped: $_"" }
             }
-            # Restart tray for current user
             Get-WmiObject Win32_Process -Filter ""Name='powershell.exe'"" -ErrorAction SilentlyContinue |
                 Where-Object { $_.CommandLine -like ""*DiskHealthTray*"" } |
                 ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
             Start-Sleep -Seconds 1
-            Start-Process powershell.exe -ArgumentList ""-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `""$trayDest`"""" -ErrorAction SilentlyContinue
+            Start-Process -FilePath ""wscript.exe"" -ArgumentList ""//B //Nologo `""$trayVbsDest`"""" -WindowStyle Hidden -ErrorAction SilentlyContinue
         } catch { Log-Info ""Tray update skipped: $_"" }
         try {
             Start-Process powershell.exe -ArgumentList ""-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `""$dest`"" -ServerUrl `""$ServerUrl`"" -PollInterval $PollInterval""
@@ -300,13 +314,11 @@ function Get-DiskHealth {
     $scMap=@{}
     if ($scBin) { try { $scMap=Get-SmartctlData -Bin $scBin } catch { Log-Warn ""smartctl failed: $_"" } }
     $wmiMap=Get-WmiSmartData
-    # Only warn about WMI if smartctl also got nothing — WMI fails on VMs/NVMe/no-admin which is normal when smartctl covers it
     if ($wmiMap.ContainsKey('_error')) {
         $wmiErr = $wmiMap['_error']; $wmiMap.Remove('_error')
         if ($scMap.Count -eq 0) { Log-Warn ""No SMART data available (WMI: $wmiErr). Run agent as Administrator for full data."" }
         else { Log-Info ""WMI SMART skipped (smartctl active)."" }
     }
-    # Build index-ordered list from smartctl for positional fallback
     $scByIndex=@{}
     if ($scMap.Count -gt 0) {
         $scBinT=Find-Smartctl
@@ -316,7 +328,6 @@ function Get-DiskHealth {
             foreach ($line in $scanLines2) {
                 $line=$line.Trim(); if (-not $line) { continue }
                 if ($line -match '^(/dev/\S+)') {
-                    # find which scMap entry came from this path
                     foreach ($kv in $scMap.GetEnumerator()) {
                         if ($kv.Value.path -eq $matches[1]) { $scByIndex[$devIdx]=$kv.Value; break }
                     }
@@ -331,12 +342,10 @@ function Get-DiskHealth {
         $wmiModel =if($pd.Model){$pd.Model.Trim()}else{'Unknown'}
         $wmiIface =if($pd.InterfaceType){$pd.InterfaceType.Trim()}else{'Unknown'}
         $s=$null
-        # 1st: match by serial
         if ($wmiSerial) {
             $normSerial=Normalize-Serial $wmiSerial
             if ($scMap.ContainsKey($normSerial)) { $s=$scMap[$normSerial] }
         }
-        # 2nd: serial mismatch is common for NVMe — fall back to positional index match
         if (-not $s -and $scByIndex.ContainsKey($idx)) { $s=$scByIndex[$idx] }
         $smartStat='Unknown'
         $temp=$null;$realloc=$null;$pending=$null;$uncorr=$null
@@ -458,14 +467,18 @@ function Poll-Commands { param([string]$AgentId)
     $obj=$null
     try{$obj=$resp|ConvertFrom-Json}catch{return $null}
     $commands=$obj.commands
-    # Read poll_interval from server response
     $serverInterval=$null
-    try { $si=[int]$obj.poll_interval; if($si -ge 60){$serverInterval=$si} } catch {}
+    try { $si=[int]$obj.poll_interval; if($si -ge 10){$serverInterval=$si} } catch {}
     if(-not$commands-or$commands.Count-eq0){return $serverInterval}
     foreach ($cmd in $commands) {
         $cmdId=$cmd.command_id; $action=$cmd.action
         switch($action){
-            ""get_disk_health"" { Send-Report -AgentId $AgentId -CmdId $cmdId }
+            ""get_disk_health"" {
+                Send-Report -AgentId $AgentId -CmdId $cmdId
+                Invoke-JsonPost ""$ServerUrl/api/ack"" (ConvertTo-SafeJson @{
+                    command_id=$cmdId; result=@{reported=$true}
+                })|Out-Null
+            }
             ""ping"" {
                 Invoke-JsonPost ""$ServerUrl/api/ack"" (ConvertTo-SafeJson @{
                     command_id=$cmdId; result=@{pong=$true; timestamp=(Get-Date).ToString(""o"")}
@@ -508,7 +521,6 @@ function Poll-Commands { param([string]$AgentId)
 function Main {
     $agentId=Get-AgentId; $registered=$false
     Log-Info ""DiskHealth Agent v$AgentVersion starting. ID=$agentId  Server=$ServerUrl""
-    # Write server URL so tray can build panel link immediately on startup
     try { Set-Content -Path (Join-Path $AgentDir ""server_url.txt"") -Value $ServerUrl -Encoding ASCII } catch {}
     while(-not$registered){
         $registered=Register-Agent -AgentId $agentId
@@ -516,7 +528,7 @@ function Main {
     }
     Send-Report -AgentId $agentId
     $CMD_INTERVAL    = 5
-    $REPORT_INTERVAL = [Math]::Max(60, $PollInterval)
+    $REPORT_INTERVAL = [Math]::Max(10, $PollInterval)
     $lastReport   = Get-Date
     $lastRegister = Get-Date
     Log-Info ""Main loop started. CMD_INTERVAL=${CMD_INTERVAL}s  SCAN_INTERVAL=${REPORT_INTERVAL}s""
@@ -524,7 +536,7 @@ function Main {
         Start-Sleep -Seconds $CMD_INTERVAL
         try{
             $newInterval = Poll-Commands -AgentId $agentId
-            if ($newInterval -ne $null -and $newInterval -ge 60 -and $newInterval -ne $REPORT_INTERVAL) {
+            if ($newInterval -ne $null -and $newInterval -ge 10 -and $newInterval -ne $REPORT_INTERVAL) {
                 Log-Info ""Poll interval updated by server: ${REPORT_INTERVAL}s -> ${newInterval}s""
                 $REPORT_INTERVAL = $newInterval
             }
@@ -543,11 +555,11 @@ function Main {
 Main
 ";
 
-        public const string Tray = @"# DiskHealth Tray Icon
+        public const string Tray = @"# DiskHealth Tray Icon  —  Hard drive + signal bars design
 # Runs as logged-in user at logon - shows agent status in system tray
 param([string]$InstallDir = ""$env:ProgramFiles\DiskHealthAgent"")
 
-# ── Single-instance guard (prevents duplicate tray icons on reinstall) ──────
+# ── Single-instance guard ────────────────────────────────────────────────────
 $mutexName = ""Global\DiskHealthTrayIcon""
 $mutex     = New-Object System.Threading.Mutex($false, $mutexName)
 $owned     = $false
@@ -558,110 +570,214 @@ if (-not $owned) { $mutex.Dispose(); exit 0 }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$LogFile    = Join-Path $InstallDir ""agent.log""
-$AgentTask  = ""DiskHealthAgent""
+$LogFile   = Join-Path $InstallDir ""agent.log""
+$AgentTask = ""DiskHealthAgent""
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Make-Icon  —  Robot Face with status indicator dot
+#
+#  -Status  ""ok""      → green dot   (healthy / running)
+#           ""warning"" → amber dot   (warning)
+#           ""error""   → red dot     (critical)
+#           ""stopped"" → red dot     (agent not running)
+#           (anything else) → grey dot
+#
+#  Renders at 128×128 then scales to 48×48 for a large, crisp tray icon.
+# ═══════════════════════════════════════════════════════════════════════════════
 function Make-Icon {
-    param([string]$Color = ""#22c55e"")
-    # Draw at 32x32 so Windows taskbar renders it as large as other icons
-    $bmp = New-Object System.Drawing.Bitmap(32,32)
+    param([string]$Status = ""ok"")
+
+    switch ($Status) {
+        ""ok""      { $statusCol = [System.Drawing.Color]::FromArgb(255,  34, 197,  94) }
+        ""warning"" { $statusCol = [System.Drawing.Color]::FromArgb(255, 245, 158,  11) }
+        ""error""   { $statusCol = [System.Drawing.Color]::FromArgb(255, 239,  68,  68) }
+        ""stopped"" { $statusCol = [System.Drawing.Color]::FromArgb(255, 239,  68,  68) }
+        default    { $statusCol = [System.Drawing.Color]::FromArgb(255, 100, 116, 139) }
+    }
+
+    # ── Palette ───────────────────────────────────────────────────────────────
+    $cBody       = [System.Drawing.Color]::FromArgb(255,  44,  62,  80)   # dark slate body
+    $cBodyBorder = [System.Drawing.Color]::FromArgb(255,  86, 101, 115)   # border/details
+    $cEye        = [System.Drawing.Color]::FromArgb(255,  52, 152, 219)   # blue eyes
+    $cPupil      = [System.Drawing.Color]::FromArgb(255,  26,  37,  47)   # pupil
+    $cShine      = [System.Drawing.Color]::FromArgb(200, 255, 255, 255)   # eye highlight
+    $cMouth      = [System.Drawing.Color]::FromArgb(255,  86, 101, 115)   # mouth bar
+    $cStatusRim  = [System.Drawing.Color]::FromArgb(180,   0,   0,   0)   # status dot rim
+
+    $sz  = 128
+    $bmp = New-Object System.Drawing.Bitmap($sz, $sz)
     $g   = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    $col   = [System.Drawing.ColorTranslator]::FromHtml($Color)
-    $light = [System.Drawing.Color]::FromArgb(255,
-                [math]::Min(255,$col.R+80),
-                [math]::Min(255,$col.G+80),
-                [math]::Min(255,$col.B+80))
-    $dark  = [System.Drawing.Color]::FromArgb(255,
-                [math]::Max(0,$col.R-60),
-                [math]::Max(0,$col.G-60),
-                [math]::Max(0,$col.B-60))
+    # ── Antenna stem ─────────────────────────────────────────────────────────
+    $antPen = New-Object System.Drawing.Pen($cBodyBorder, 6)
+    $antPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $antPen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+    $g.DrawLine($antPen, 64, 32, 64, 10)
+    $antPen.Dispose()
+    # Antenna tip ball
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cBodyBorder)), 50, 4, 28, 20)
 
-    # Drive body
-    $bodyBrush = New-Object System.Drawing.SolidBrush($col)
-    $g.FillRectangle($bodyBrush, 2, 6, 28, 20)
+    # ── Robot head (rounded rectangle) ───────────────────────────────────────
+    $headPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $rx = 16
+    $headPath.AddArc( 10, 32, $rx*2, $rx*2, 180, 90)
+    $headPath.AddArc(108, 32, $rx*2, $rx*2, 270, 90)
+    $headPath.AddArc(108,100, $rx*2, $rx*2,   0, 90)
+    $headPath.AddArc( 10,100, $rx*2, $rx*2,  90, 90)
+    $headPath.CloseFigure()
+    $g.FillPath((New-Object System.Drawing.SolidBrush($cBody)), $headPath)
+    $g.DrawPath((New-Object System.Drawing.Pen($cBodyBorder, 4)), $headPath)
+    $headPath.Dispose()
 
-    # Top highlight band
-    $hlBrush = New-Object System.Drawing.SolidBrush($light)
-    $g.FillRectangle($hlBrush, 2, 6, 28, 5)
+    # ── Left eye ─────────────────────────────────────────────────────────────
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cEye)),   18, 44, 36, 36)
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cPupil)), 26, 52, 20, 20)
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cShine)), 30, 54,  9,  9)
 
-    # Bottom shadow band
-    $shBrush = New-Object System.Drawing.SolidBrush($dark)
-    $g.FillRectangle($shBrush, 2, 21, 28, 5)
+    # ── Right eye ────────────────────────────────────────────────────────────
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cEye)),   74, 44, 36, 36)
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cPupil)), 82, 52, 20, 20)
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($cShine)), 86, 54,  9,  9)
 
-    # Outline
-    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(230,0,0,0), 1.5)
-    $g.DrawRectangle($pen, 2, 6, 27, 19)
+    # ── Mouth bar ────────────────────────────────────────────────────────────
+    $g.FillRectangle((New-Object System.Drawing.SolidBrush($cMouth)), 26, 94, 76, 14)
 
-    # Drive label slot (dark bar in middle left — looks like a real HDD)
-    $slotBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(100,0,0,0))
-    $g.FillRectangle($slotBrush, 4, 14, 14, 4)
-
-    # LED glow (large, right side)
-    $glowBrush  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(140,$col.R,$col.G,$col.B))
-    $whiteBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-    $g.FillEllipse($glowBrush,  20, 13, 8, 8)
-    $g.FillEllipse($whiteBrush, 22, 15, 4, 4)
+    # ── Status indicator dot (lower-right corner of head) ────────────────────
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush($statusCol)), 88, 90, 30, 30)
+    $g.DrawEllipse((New-Object System.Drawing.Pen($cStatusRim, 2)),     88, 90, 30, 30)
 
     $g.Dispose()
-    $bodyBrush.Dispose(); $hlBrush.Dispose(); $shBrush.Dispose()
-    $pen.Dispose(); $slotBrush.Dispose(); $glowBrush.Dispose(); $whiteBrush.Dispose()
 
-    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    # ── Scale 128×128 → 48×48 ────────────────────────────────────────────────
+    $out = New-Object System.Drawing.Bitmap(48, 48)
+    $ig  = [System.Drawing.Graphics]::FromImage($out)
+    $ig.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $ig.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $ig.DrawImage($bmp, 0, 0, 48, 48)
+    $ig.Dispose(); $bmp.Dispose()
+
+    return [System.Drawing.Icon]::FromHandle($out.GetHicon())
 }
 
 function Get-AgentStatus {
-    if (-not (Test-Path $LogFile)) { return @{color=""#f59e0b"";tip=""DiskHealth Agent`nLog not found""} }
+    if (-not (Test-Path $LogFile)) {
+        return @{status=""ok"";tip=""DiskHealth Agent`nStatus: Starting up...""}
+    }
     try {
-        # Use FileShare::ReadWrite so we can read while the agent has the file open for writing
-        $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $reader = New-Object System.IO.StreamReader($stream)
-        $content = $reader.ReadToEnd()
-        $reader.Close(); $stream.Close()
-        $lines = $content -split ""`r?`n"" | Where-Object { $_ } | Select-Object -Last 10
+        $stream  = [System.IO.File]::Open($LogFile,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
+        $reader  = New-Object System.IO.StreamReader($stream)
+        $content = $reader.ReadToEnd(); $reader.Close(); $stream.Close()
+        $lines = $content -split ""`r?`n"" | Where-Object { $_ } | Select-Object -Last 60
         $last  = $lines | Where-Object { $_ -match '\[INFO \]|\[WARN \]|\[ERROR\]' } | Select-Object -Last 1
         $ts    = if ($last -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { $matches[1] } else { ""Unknown"" }
-        if     ($last -match 'Report accepted') { return @{color=""#22c55e"";tip=""DiskHealth Agent`nLast report: $ts`nStatus: OK""} }
-        elseif ($last -match 'ERROR')           { return @{color=""#ef4444"";tip=""DiskHealth Agent`nLast event: $ts`nStatus: Error""} }
-        elseif ($last -match 'WARN')            { return @{color=""#f59e0b"";tip=""DiskHealth Agent`nLast event: $ts`nStatus: Warning""} }
-        else                                    { return @{color=""#22c55e"";tip=""DiskHealth Agent`nLast event: $ts`nStatus: Running""} }
-    } catch { return @{color=""#f59e0b"";tip=""DiskHealth Agent`nCould not read log""} }
+        $lastReport = $lines | Where-Object { $_ -match 'Report accepted' } | Select-Object -Last 1
+        $rts = if ($lastReport -match '\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]') { $matches[1] } else { $null }
+        if     ($last -match 'ERROR')   { return @{status=""error"";  tip=""DiskHealth Agent`nLast event: $ts`nStatus: Error""} }
+        elseif ($last -match 'WARN ')   { return @{status=""warning"";tip=""DiskHealth Agent`nLast event: $ts`nStatus: Warning""} }
+        elseif ($rts)                   { return @{status=""ok"";     tip=""DiskHealth Agent`nLast report: $rts`nStatus: OK""} }
+        else                            { return @{status=""ok"";     tip=""DiskHealth Agent`nLast event: $ts`nStatus: Running""} }
+    } catch { return @{status=""ok"";tip=""DiskHealth Agent`nStatus: Running""} }
 }
 
 function Is-AgentRunning {
-    $p = Get-WmiObject Win32_Process -Filter ""Name='powershell.exe'"" -ErrorAction SilentlyContinue |
-         Where-Object { $_.CommandLine -like ""*DiskHealthAgent.ps1*"" }
-    return ($null -ne $p)
+    try {
+        if (Test-Path $LogFile) {
+            $age = ((Get-Date) - (Get-Item $LogFile -ErrorAction Stop).LastWriteTime).TotalMinutes
+            if ($age -lt 3) { return $true }
+        }
+    } catch {}
+    try {
+        $t = Get-ScheduledTask -TaskName $AgentTask -ErrorAction SilentlyContinue
+        if ($t -and $t.State -eq ""Running"") { return $true }
+    } catch {}
+    try {
+        $ps = @(Get-Process -Name powershell,pwsh -ErrorAction SilentlyContinue)
+        if ($ps.Count -gt 0 -and (Test-Path $LogFile)) {
+            $age = ((Get-Date) - (Get-Item $LogFile).LastWriteTime).TotalMinutes
+            if ($age -lt 15) { return $true }
+        }
+    } catch {}
+    return $false
 }
 
-$status       = Get-AgentStatus
-$tray         = New-Object System.Windows.Forms.NotifyIcon
-$tray.Icon    = Make-Icon -Color $status.color
-$tray.Text    = (($status.tip -split ""`n"")[0..1] -join "" | "").Substring(0, [Math]::Min(63, (($status.tip -split ""`n"")[0..1] -join "" | "").Length))
-$tray.Visible = $true
+# ── Resolve panel URL ─────────────────────────────────────────────────────────
+$ServerUrlFile = Join-Path $InstallDir ""server_url.txt""
+$AgentIdFile   = Join-Path $InstallDir ""agent_id.txt""
+function Get-PanelUrl {
+    try {
+        if (-not (Test-Path $ServerUrlFile)) { return $null }
+        $base = (Get-Content $ServerUrlFile -Raw -ErrorAction SilentlyContinue).Trim()
+        if (-not $base -or $base -notmatch ""^https?://"") { return $null }
+        if (Test-Path $AgentIdFile) {
+            $id = (Get-Content $AgentIdFile -Raw -ErrorAction SilentlyContinue).Trim()
+            if ($id -match ""^[0-9a-f\-]{36}$"") { return ""$base/?agent_id=$id"" }
+        }
+        return $base
+    } catch { return $null }
+}
 
-$menu     = New-Object System.Windows.Forms.ContextMenuStrip
-$miTitle  = $menu.Items.Add(""DiskHealth Agent"")
+# ── Startup ───────────────────────────────────────────────────────────────────
+$script:_StartTime  = Get-Date
+$script:_GraceSecs  = 45
+$script:_LastStatus = ""ok""
+
+$st = Get-AgentStatus
+
+$tray         = New-Object System.Windows.Forms.NotifyIcon
+$tray.Icon    = Make-Icon -Status $st.status
+$tray.Visible = $true
+$_tip = (($st.tip -split ""`n"")[0..1] -join "" | "")
+$tray.Text    = $_tip.Substring(0,[Math]::Min(63,$_tip.Length))
+
+# ── Left-click → open panel ───────────────────────────────────────────────────
+$tray.Add_Click({
+    if ([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $url = Get-PanelUrl
+        if ($url) { Start-Process $url -ErrorAction SilentlyContinue }
+        else {
+            [System.Windows.Forms.MessageBox]::Show(
+                ""Server URL not found.`nThe agent may not have connected yet."",
+                ""DiskHealth Agent"",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+    }
+})
+
+# ── Context menu ──────────────────────────────────────────────────────────────
+$menu    = New-Object System.Windows.Forms.ContextMenuStrip
+$miTitle = $menu.Items.Add(""DiskHealth Agent"")
 $miTitle.Enabled = $false
 $miTitle.Font    = New-Object System.Drawing.Font(""Segoe UI"", 8, [System.Drawing.FontStyle]::Bold)
 $menu.Items.Add(""-"") | Out-Null
+
+$miPanel = $menu.Items.Add(""Open Web Panel"")
+$miPanel.Add_Click({
+    $url = Get-PanelUrl
+    if ($url) { Start-Process $url -ErrorAction SilentlyContinue }
+    else {
+        [System.Windows.Forms.MessageBox]::Show(
+            ""Server URL not found.`nThe agent may not have connected yet."",
+            ""DiskHealth Agent"",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    }
+})
 
 $miLog = $menu.Items.Add(""View Agent Log"")
 $miLog.Add_Click({
     try {
         $tmp = Join-Path $env:TEMP ""DiskHealthAgent_log_view.txt""
-        $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $stream = [System.IO.File]::Open($LogFile,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
         $reader = New-Object System.IO.StreamReader($stream)
-        $content = $reader.ReadToEnd()
-        $reader.Close(); $stream.Close()
-        [System.IO.File]::WriteAllText($tmp, $content)
+        $c = $reader.ReadToEnd(); $reader.Close(); $stream.Close()
+        [System.IO.File]::WriteAllText($tmp, $c)
         Start-Process notepad.exe -ArgumentList $tmp -ErrorAction SilentlyContinue
-    } catch {
-        Start-Process notepad.exe -ArgumentList $LogFile -ErrorAction SilentlyContinue
-    }
+    } catch { Start-Process notepad.exe -ArgumentList $LogFile -ErrorAction SilentlyContinue }
 })
 
 $miRestart = $menu.Items.Add(""Restart Agent"")
@@ -684,24 +800,38 @@ $miExit.Add_Click({
 })
 $tray.ContextMenuStrip = $menu
 
+# ── Timer: refresh icon every 15 s ───────────────────────────────────────────
 $timer          = New-Object System.Windows.Forms.Timer
-$timer.Interval = 30000
+$timer.Interval = 15000
 $timer.Add_Tick({
+    $inGrace = ((Get-Date) - $script:_StartTime).TotalSeconds -lt $script:_GraceSecs
+    if ($inGrace) { return }
+
     if (-not (Is-AgentRunning)) {
-        $tray.Icon = Make-Icon -Color ""#ef4444""
-        $tray.Text = ""DiskHealth Agent | NOT RUNNING""
-    } else {
-        $s = Get-AgentStatus
-        $tray.Icon = Make-Icon -Color $s.color
-        $tray.Text = (($s.tip -split ""`n"")[0..1] -join "" | "").Substring(0,[Math]::Min(63,(($s.tip -split ""`n"")[0..1] -join "" | "").Length))
+        if ($script:_LastStatus -ne ""stopped"") {
+            $tray.Icon = Make-Icon -Status ""stopped""
+            $tray.Text = ""DiskHealth Agent | NOT RUNNING""
+            $tray.ShowBalloonTip(6000,""DiskHealth Agent"",""Agent is not running! Right-click > Restart Agent."",[System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+        $script:_LastStatus = ""stopped""
+        return
     }
+
+    $s = Get-AgentStatus
+    if ($s.status -eq ""ok"" -and $script:_LastStatus -eq ""stopped"") {
+        $tray.ShowBalloonTip(4000,""DiskHealth Agent"",""Agent is back online."",[System.Windows.Forms.ToolTipIcon]::Info)
+    }
+    $script:_LastStatus = $s.status
+    $tray.Icon = Make-Icon -Status $s.status
+    $_t = (($s.tip -split ""`n"")[0..1] -join "" | "")
+    $tray.Text = $_t.Substring(0,[Math]::Min(63,$_t.Length))
 })
 $timer.Start()
 
-$tray.ShowBalloonTip(3000,""DiskHealth Agent"",""Monitoring disk health. Running in background."",[System.Windows.Forms.ToolTipIcon]::Info)
+$tray.ShowBalloonTip(3000,""DiskHealth Agent"",""Monitoring disk health. Click icon to open web panel."",[System.Windows.Forms.ToolTipIcon]::Info)
 [System.Windows.Forms.Application]::Run()
 
-# ── Cleanup ──────────────────────────────────────────────────────────────────
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 $timer.Dispose()
 $tray.Dispose()
 if ($owned) { $mutex.ReleaseMutex() }
@@ -774,15 +904,10 @@ function Uninstall-Agent {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Write-OK ""Uninstall complete.""
 }
-
 function Install-Smartctl {
     $smartctlPath = ""$env:ProgramFiles\smartmontools\bin\smartctl.exe""
-    if (Test-Path $smartctlPath) {
-        Write-OK ""smartmontools already installed.""
-        return $true
-    }
+    if (Test-Path $smartctlPath) { Write-OK ""smartmontools already installed.""; return $true }
     Write-Step ""Installing smartmontools (required for SSD/NVMe SMART data)...""
-    # Try winget first (Windows 10 1709+)
     $wingetOk = $false
     try {
         $wg = Get-Command winget.exe -ErrorAction Stop
@@ -792,16 +917,11 @@ function Install-Smartctl {
                 -ArgumentList ""install --id smartmontools.smartmontools --silent --accept-package-agreements --accept-source-agreements"" `
                 -Wait -PassThru -WindowStyle Hidden
             if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335212) {
-                # -1978335212 = already installed
-                if (Test-Path $smartctlPath) {
-                    Write-OK ""smartmontools installed via winget.""
-                    $wingetOk = $true
-                }
+                if (Test-Path $smartctlPath) { Write-OK ""smartmontools installed via winget.""; $wingetOk = $true }
             }
         }
     } catch {}
     if ($wingetOk) { return $true }
-    # Fallback: download MSI directly from smartmontools.org
     Write-Step ""winget unavailable or failed, downloading MSI directly...""
     try {
         $msiUrl  = ""https://www.smartmontools.org/airfiles/smartmontools-7.4-1.win32-setup.exe""
@@ -810,13 +930,8 @@ function Install-Smartctl {
         $wc.DownloadFile($msiUrl, $msiPath)
         $proc = Start-Process -FilePath $msiPath -ArgumentList ""/S"" -Wait -PassThru
         Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-        if (Test-Path $smartctlPath) {
-            Write-OK ""smartmontools installed via direct download.""
-            return $true
-        } else {
-            Write-Warn ""smartmontools installer ran but binary not found. SSD/NVMe data may be unavailable.""
-            return $false
-        }
+        if (Test-Path $smartctlPath) { Write-OK ""smartmontools installed via direct download.""; return $true }
+        else { Write-Warn ""smartmontools installer ran but binary not found. SSD/NVMe data may be unavailable.""; return $false }
     } catch {
         Write-Warn ""Could not install smartmontools: $_""
         Write-Warn ""SSD/NVMe SMART data will be unavailable. Install manually: winget install smartmontools.smartmontools""
@@ -854,7 +969,10 @@ function Install-Agent {
 <?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.3"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
   <RegistrationInfo><Description>DiskHealth Agent</Description></RegistrationInfo>
-  <Triggers><BootTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></BootTrigger></Triggers>
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></BootTrigger>
+    <LogonTrigger><Enabled>true</Enabled><Delay>PT20S</Delay></LogonTrigger>
+  </Triggers>
   <Principals><Principal id=""Author""><UserId>SYSTEM</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -862,6 +980,8 @@ function Install-Agent {
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Enabled>true</Enabled>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
   </Settings>
   <Actions><Exec>
@@ -894,6 +1014,13 @@ function Install-Agent {
     Write-Step ""Setting up system tray icon...""
     $TrayScript = Join-Path $InstallDir ""DiskHealthTray.ps1""
     $TrayTask   = ""DiskHealthTray""
+    # Use local copy extracted alongside installer — no server download needed
+    $localTray = Join-Path $scriptDir ""DiskHealthTray.ps1""
+    if (-not (Test-Path $localTray)) { $localTray = Join-Path $PSScriptRoot ""DiskHealthTray.ps1"" }
+    if ((Test-Path $localTray) -and (-not (Test-Path $TrayScript))) {
+        Copy-Item -Path $localTray -Destination $TrayScript -Force
+        Write-OK ""Tray script copied from installer.""
+    }
     if (-not (Test-Path $TrayScript)) {
         try {
             Write-Step ""Downloading tray script from server...""
@@ -902,18 +1029,30 @@ function Install-Agent {
         } catch { Write-Warn ""Could not download tray script: $_"" }
     }
     if (Test-Path $TrayScript) {
-        $trayArgs = ""-NonInteractive -ExecutionPolicy Bypass -File `""$TrayScript`""""
+        # Build VBS content via char concatenation — the only safe approach inside a C# verbatim string.
+        # wscript.exe //B has no console subsystem: guaranteed no terminal window.
+        $TrayVbs = Join-Path $InstallDir ""StartTray.vbs""
+        $q = [char]34
+        $vbsContent = 'Dim sh : Set sh = CreateObject(' + $q + 'WScript.Shell' + $q + ')' + [char]13 + [char]10 +
+                      'sh.Run ' + $q + 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + $q + $q + $TrayScript + $q + $q + $q + ', 0, False' + [char]13 + [char]10 +
+                      'Set sh = Nothing'
+        [System.IO.File]::WriteAllText($TrayVbs, $vbsContent, [System.Text.Encoding]::ASCII)
         $trayCreated = $false
-        # Use XML method to handle spaces in path correctly
         try {
-            $xmlEscArgs  = [System.Security.SecurityElement]::Escape($trayArgs)
-            $xmlEscExe   = [System.Security.SecurityElement]::Escape($psExe)
-            $xmlEscDir   = [System.Security.SecurityElement]::Escape($InstallDir)
+            $wArgs      = ""//B //Nologo `""$TrayVbs`""""
+            $xmlEscArgs = [System.Security.SecurityElement]::Escape($wArgs)
+            $xmlEscExe  = [System.Security.SecurityElement]::Escape(""wscript.exe"")
+            $xmlEscDir  = [System.Security.SecurityElement]::Escape($InstallDir)
             $trayXml = @""
 <?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.3"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
   <RegistrationInfo><Description>DiskHealth Tray Icon</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT10S</Delay>
+    </LogonTrigger>
+  </Triggers>
   <Principals><Principal id=""Author""><GroupId>S-1-5-32-545</GroupId><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -921,6 +1060,8 @@ function Install-Agent {
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <StartWhenAvailable>true</StartWhenAvailable>
   </Settings>
   <Actions><Exec>
     <Command>$xmlEscExe</Command>
@@ -939,13 +1080,12 @@ function Install-Agent {
         } catch { Write-Warn ""Tray task XML error: $_"" }
         if ($trayCreated) {
             Write-OK ""Tray logon task created.""
-            # Kill any running tray instance before starting the new one
             Get-WmiObject Win32_Process -Filter ""Name='powershell.exe'"" -ErrorAction SilentlyContinue |
                 Where-Object { $_.CommandLine -like ""*DiskHealthTray*"" } |
                 ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
             Start-Sleep -Seconds 1
             try {
-                Start-Process -FilePath $psExe -ArgumentList $trayArgs -WindowStyle Hidden
+                Start-Process -FilePath ""wscript.exe"" -ArgumentList ""//B //Nologo `""$TrayVbs`"""" -WindowStyle Hidden
                 Write-OK ""Tray icon launched.""
             } catch { Write-Warn ""Tray auto-start failed - will appear on next logon."" }
         } else { Write-Warn ""Could not create tray task - will appear on next logon."" }
